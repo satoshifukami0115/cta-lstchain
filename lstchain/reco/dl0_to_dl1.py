@@ -1,6 +1,6 @@
-"""This is a module for extracting data from simtelarray files and 
-calculate image parameters of the events: Hillas parameters, timing 
-parameters. They can be stored in HDF5 file. The option of saving the 
+"""This is a module for extracting data from simtelarray files and
+calculate image parameters of the events: Hillas parameters, timing
+parameters. They can be stored in HDF5 file. The option of saving the
 full camera image is also available.
 
 Usage:
@@ -8,488 +8,434 @@ Usage:
 "import calib_dl0_to_dl1"
 
 """
+import os
+import logging
 import numpy as np
-from ctapipe.image import hillas_parameters, hillas_parameters_2, tailcuts_clean
-from ctapipe.io.eventsourcefactory import EventSourceFactory
-from ctapipe.image.charge_extractors import LocalPeakIntegrator
-from ctapipe.image import timing_parameters as time
-from ctapipe.instrument import OpticsDescription
+from ctapipe.image import (
+    hillas_parameters,
+    tailcuts_clean,
+    HillasParameterizationError,
+)
+
 from ctapipe.utils import get_dataset_path
-from ctapipe.calib import CameraCalibrator
 from ctapipe.io import event_source
 from ctapipe.io import HDF5TableWriter
-import pyhessio
-import pandas as pd
-import astropy.units as units
-import h5py
-
+from eventio.simtel.simtelfile import SimTelFile
+import math
 from . import utils
-from ..calib.calib import lst_calibration
-from ..io.containers import DL1ParametersContainer
+from ..io.lstcontainers import ExtraImageInfo
+from ..calib.camera import lst_calibration, load_calibrator_from_config
+from ..io import DL1ParametersContainer, standard_config, replace_config
+from ctapipe.image.cleaning import number_of_islands
 
+import tables
+from functools import partial
+from ..io import write_simtel_energy_histogram, write_mcheader, write_array_info, global_metadata
+from ..io import add_global_metadata, write_metadata, write_subarray_tables
+from ..io.io import add_column_table
 
-### PARAMETERS - TODO: use a yaml config file
+import pandas as pd
+from . import disp
+import astropy.units as u
+from .utils import sky_to_camera
+from ctapipe.instrument import OpticsDescription
+from traitlets.config.loader import Config
+from ..calib.camera.calibrator import LSTCameraCalibrator
+from ..calib.camera.r0 import LSTR0Corrections
+from ..calib.camera.calib import combine_channels
+from ..pointing import PointingPosition
 
+__all__ = [
+    'get_dl1',
+    'r0_to_dl1',
+]
 
-allowed_tels = {1}  # select LST1 only
-max_events = None  # limit the number of events to analyse in files - None if no limit
-
-# Add option to use custom calibration
-cal = CameraCalibrator(r1_product='HESSIOR1Calibrator', extractor_product='NeighbourPeakIntegrator')
 
 cleaning_method = tailcuts_clean
-cleaning_parameters = {'boundary_thresh': 3,
-                       'picture_thresh': 6,
-                       'keep_isolated_pixels': False,
-                       'min_number_picture_neighbors': 1
-                       }
-
-channel = 0
 
 
-def get_dl1(calibrated_event, telescope_id):
+filters = tables.Filters(
+    complevel=5,    # enable compression, with level 0=disabled, 9=max
+    complib='blosc:zstd',   #  compression using blosc
+    fletcher32=True,    # attach a checksum to each chunk for error correction
+    bitshuffle=False,   # for BLOSC, shuffle bits for better compression
+)
+
+
+def get_dl1(calibrated_event, telescope_id, dl1_container=None, custom_config={}, use_main_island=True):
     """
-    Return a DL1ParametersContainer of extracted features from a calibrated event
+    Return a DL1ParametersContainer of extracted features from a calibrated event.
+    The DL1ParametersContainer can be passed to be filled if created outside the function
+    (faster for multiple event processing)
 
     Parameters
     ----------
-    event: ctapipe event container
-    telescope_id:
+    calibrated_event: ctapipe event container
+    telescope_id: int
+    dl1_container: DL1ParametersContainer
+    config_file: path to a configuration file
+        configuration used for tailcut cleaning
+        superseeds the standard configuration
 
     Returns
     -------
     DL1ParametersContainer
     """
-    dl1_container = DL1ParametersContainer()
+
+    config = replace_config(standard_config, custom_config)
+    cleaning_parameters = config["tailcut"]
+
+    dl1_container = DL1ParametersContainer() if dl1_container is None else dl1_container
 
     tel = calibrated_event.inst.subarray.tels[telescope_id]
     dl1 = calibrated_event.dl1.tel[telescope_id]
     camera = tel.camera
-    signal_pixels = cleaning_method(camera, dl1.image[channel],
-                                    **cleaning_parameters)
 
-    image = dl1.image[channel]
-    image[~signal_pixels] = 0
+    image = dl1.image
+    pulse_time = dl1.pulse_time
 
-    peakpos = dl1.peakpos[channel]
+    signal_pixels = cleaning_method(camera, image, **cleaning_parameters)
 
-    if image.sum() > 0:
-        try:
-            hillas = hillas_parameters(
-                camera,
-                image
-            )
-            ## Fill container ##
-            dl1_container.fill_mc(calibrated_event)
-            dl1_container.fill_hillas(hillas)
-            dl1_container.fill_event_info(calibrated_event)
-            dl1_container.set_mc_core_distance(calibrated_event, telescope_id)
-            # dl1_container.mc_type = utils.guess_type(infile)
-            dl1_container.set_timing_features(camera, image, peakpos, hillas)
-            dl1_container.set_source_camera_position(calibrated_event, telescope_id)
-            dl1_container.set_disp([dl1_container.src_x, dl1_container.src_y], hillas)
-            return dl1_container
+    if image[signal_pixels].sum() > 0:
 
-        except:
-            print("Bad event")
-            return None
+        # check the number of islands 
+        num_islands, island_labels = number_of_islands(camera, signal_pixels)
+
+        if use_main_island:
+            n_pixels_on_island = np.zeros(num_islands+1)
+
+            for iisland in range(1, num_islands+1):
+                n_pixels_on_island[iisland] = np.sum(island_labels==iisland)
+              
+            max_island_label = np.argmax(n_pixels_on_island)
+            signal_pixels[island_labels!=max_island_label] = False
+
+        hillas = hillas_parameters(camera[signal_pixels], image[signal_pixels])
+
+        # Fill container
+        dl1_container.fill_hillas(hillas)
+        dl1_container.fill_event_info(calibrated_event)
+        dl1_container.set_mc_core_distance(calibrated_event, telescope_id)
+        dl1_container.set_mc_type(calibrated_event)
+        dl1_container.set_timing_features(camera[signal_pixels],
+                                          image[signal_pixels],
+                                          pulse_time[signal_pixels],
+                                          hillas)
+        dl1_container.set_leakage(camera, image, signal_pixels)
+        dl1_container.n_islands = num_islands
+        dl1_container.set_telescope_info(calibrated_event, telescope_id)
+
+        return dl1_container
 
     else:
         return None
 
 
-def r0_to_dl1(input_filename=get_dataset_path('gamma_test_large.simtel.gz'), output_filename=None):
+def r0_to_dl1(input_filename=get_dataset_path('gamma_test_large.simtel.gz'),
+              output_filename=None,
+              custom_config={},
+              pedestal_path=None,
+              calibration_path=None,
+              time_calibration_path=None,
+              pointing_file_path=None
+              ):
     """
     Chain r0 to dl1
     Save the extracted dl1 parameters in output_filename
 
     Parameters
     ----------
-    input_filename: str - path to input file, default: `gamma_test_large.simtel.gz`
-    output_filename: str - path to output file, default: `./` + basename(input_filename)
+    input_filename: str
+        path to input file, default: `gamma_test_large.simtel.gz`
+    output_filename: str
+        path to output file, default: `./` + basename(input_filename)
+    config_file: path to a configuration file
+    pointing_file_path: path to the Drive log with the pointing information
 
     Returns
     -------
 
     """
-    import os
-    output_filename = 'dl1_' + os.path.basename(input_filename).split('.')[0] + '.h5' if output_filename is None \
-        else output_filename
+    if output_filename is None:
+        output_filename = (
+            'dl1_' + os.path.basename(input_filename).split('.')[0] + '.h5'
+        )
 
-    source = event_source(input_filename)
-    source.allowed_tels = allowed_tels
-    source.max_events = max_events
+    config = replace_config(standard_config, custom_config)
 
-    with HDF5TableWriter(filename=output_filename, group_name='events', overwrite=True) as writer:
+    custom_calibration = config["custom_calibration"]
 
+    try:
+        source = event_source(input_filename, back_seekable=True)
+    except:
+        # back_seekable might not be available for other sources that eventio
+        # TODO for real data: source with calibration file and pointing file
+        source = event_source(input_filename)
+
+    is_simu = source.metadata['is_simulation']
+
+    source.allowed_tels = config["allowed_tels"]
+    source.max_events = config["max_events"]
+
+    metadata = global_metadata(source)
+    write_metadata(metadata, output_filename)
+
+    cal = load_calibrator_from_config(config)
+
+    if not is_simu:
+        # TODO : add calibration config in config file, read it and pass it here
+
+        r0_r1_calibrator = LSTR0Corrections(pedestal_path=pedestal_path,
+                                            tel_id=1)
+
+        # all this will be cleaned up in a next PR related to the configuration files
+        r1_dl1_calibrator = LSTCameraCalibrator(calibration_path=calibration_path,
+                                                time_calibration_path=time_calibration_path,
+                                                image_extractor=config['image_extractor'],
+                                                gain_threshold=Config(config).gain_selector_config['threshold'],
+                                                config=Config(config),
+                                                allowed_tels=[1],
+                                                )
+
+    dl1_container = DL1ParametersContainer()
+
+    if pointing_file_path:
+        # Open drive report
+        pointings = PointingPosition()
+        pointings.drive_path = pointing_file_path
+        drive_data = pointings._read_drive_report()
+    
+    extra_im = ExtraImageInfo()
+    extra_im.prefix = ''  # get rid of the prefix
+
+    event = next(iter(source))
+
+
+
+    write_array_info(event, output_filename)
+    ### Write extra information to the DL1 file
+    if is_simu:
+        write_mcheader(event.mcheader, output_filename, obs_id=event.r0.obs_id, filters=filters, metadata=metadata)
+        subarray = event.inst.subarray
+
+    with HDF5TableWriter(filename=output_filename,
+                         group_name='dl1/event',
+                         mode='a',
+                         filters=filters,
+                         add_prefix=True,
+                         # overwrite=True,
+                         ) as writer:
+
+        print("USING FILTERS: ", writer._h5file.filters)
+
+        if is_simu:
+            # build a mapping of tel_id back to tel_index:
+            # (note this should be part of SubarrayDescription)
+            idx = np.zeros(max(subarray.tel_indices) + 1)
+            for key, val in subarray.tel_indices.items():
+                idx[key] = val
+
+            # the final transform then needs the mapping and the number of telescopes
+            tel_list_transform = partial(utils.expand_tel_list,
+                                         max_tels=len(event.inst.subarray.tel) + 1,
+                                         )
+
+            writer.add_column_transform(
+                table_name='subarray/trigger',
+                col_name='tels_with_trigger',
+                transform=tel_list_transform
+            )
+
+        ### EVENT LOOP ###
         for i, event in enumerate(source):
-            if i%100==0: print(i)
-            # cal.calibrate(event)
+            if i % 100 == 0:
+                print(i)
 
-            # for telescope_id, dl1 in event.dl1.tel.items():
+            event.dl0.prefix = ''
+            event.mc.prefix = 'mc'
+            event.trig.prefix = ''
+
+            # write sub tables
+            if is_simu:
+                write_subarray_tables(writer, event, metadata)
+
+            if not custom_calibration and is_simu:
+                cal(event)
+
+            if not is_simu:
+                r0_r1_calibrator.calibrate(event)
+                r1_dl1_calibrator(event)
+
+
             for ii, telescope_id in enumerate(event.r0.tels_with_data):
-                camera = event.inst.subarray.tel[telescope_id].camera  # Camera geometry
 
-                lst_calibration(event, telescope_id)
+                tel = event.dl1.tel[telescope_id]
+                tel.prefix = ''  # don't really need one
+                # remove the first part of the tel_name which is the type 'LST', 'MST' or 'SST'
+                tel_name = str(event.inst.subarray.tel[telescope_id])[4:]
+                tel_name = tel_name.replace('-003', '')
 
-                dl1_container = get_dl1(event, telescope_id)
-                if dl1_container is not None:
-                    particle_name = utils.guess_type(input_filename)
+                if custom_calibration:
+                    lst_calibration(event, telescope_id)
+
+                try:
+                    dl1_filled = get_dl1(event, telescope_id,
+                                         dl1_container=dl1_container,
+                                         custom_config=config,
+                                         use_main_island=True)
+
+                except HillasParameterizationError:
+                    logging.exception(
+                        'HillasParameterizationError in get_dl1()'
+                    )
+                    continue
+
+                if dl1_filled is not None:
 
                     # Some custom def
-                    dl1_container.mc_type = utils.particle_number(particle_name)
-                    dl1_container.hadroness = 1 if dl1_container.mc_type == 1 else 0
-                    dl1_container.hadroness = dl1_container.mc_type
-                    dl1_container.wl = dl1_container.width/dl1_container.length
-                    dl1_container.mc_energy = np.log10(event.mc.energy.value * 1e3)  # Log10(Energy) in GeV
-                    dl1_container.intensity = np.log10(dl1_container.intensity)
+                    dl1_container.wl = dl1_container.width / dl1_container.length
+                    # Log10(Energy) in GeV
+                    if is_simu:
+                        dl1_container.mc_energy = event.mc.energy.value
+                        dl1_container.log_mc_energy = np.log10(event.mc.energy.value * 1e3)
+                        dl1_container.fill_mc(event)
+
+                    dl1_container.log_intensity = np.log10(dl1_container.intensity)
                     dl1_container.gps_time = event.trig.gps_time.value
 
+                    if not is_simu:
+                        # GPS time is not available for the time being. Meanwhile,
+                        # timestamps can be extracted from the UCTS and alternatively
+                        # calculated from the TIB/Dragon modules counters + NTP time
+                        # corresponding to the start of the run. For the time being,
+                        # we will store the three of them in the dl1 files.
+                        # This will be deprecated and modified back to directly use
+                        # gps_time whenever the GPS starts working reliably.
+
+                        # gps_time = event.r0.tel[telescope_id].trigger_time
+
+                        ucts_time = event.lst.tel[telescope_id].evt.ucts_timestamp * 1e-9 # nsecs
+
+                        # Get counters from the central Dragon module
+                        module_id = 82
+
+                        dragon_time = (
+                                event.lst.tel[telescope_id].svc.date +
+                                event.lst.tel[telescope_id].evt.pps_counter[module_id] +
+                                event.lst.tel[telescope_id].evt.tenMHz_counter[module_id] * 10**(-7))
+
+                        tib_time = (
+                                event.lst.tel[telescope_id].svc.date +
+                                event.lst.tel[telescope_id].evt.tib_pps_counter +
+                                event.lst.tel[telescope_id].evt.tib_tenMHz_counter * 10**(-7))
+
+                        #dl1_container.gps_time = gps_time
+                        dl1_container.tib_time = tib_time
+                        dl1_container.ucts_time = ucts_time
+                        dl1_container.dragon_time = dragon_time
+
+                        # Select the timestamps to be used for pointing interpolation
+                        if config['timestamps_pointing'] == "ucts":
+                            event_timestamps = ucts_time
+                        elif config['timestamps_pointing'] == "dragon":
+                            event_timestamps = dragon_time
+                        elif config['timestamps_pointing'] == "tib":
+                            event_timestamps = tib_time
+                        else:
+                            raise ValueError("The timestamps_pointing option is not a valid one. \
+                                    Try ucts (default), dragon or tib.")
+
+                        if pointing_file_path and event_timestamps > 0:
+                            azimuth, altitude = pointings.cal_pointingposition(event_timestamps, drive_data)
+                            event.pointing[telescope_id].azimuth = azimuth
+                            event.pointing[telescope_id].altitude = altitude
+                            dl1_container.az_tel = azimuth
+                            dl1_container.alt_tel = altitude
+
                     foclen = event.inst.subarray.tel[telescope_id].optics.equivalent_focal_length
-                    w = np.rad2deg(np.arctan2(dl1_container.width, foclen))
-                    l = np.rad2deg(np.arctan2(dl1_container.length, foclen))
-                    dl1_container.width = w.value
-                    dl1_container.length = l.value
-                    
-                    if w>=0:
-                        writer.write(camera.cam_id, [dl1_container])
+                    width = np.rad2deg(np.arctan2(dl1_container.width, foclen))
+                    length = np.rad2deg(np.arctan2(dl1_container.length, foclen))
+                    dl1_container.width = width.value
+                    dl1_container.length = length.value
+
+                    dl1_container.prefix = tel.prefix
+
+                    extra_im.tel_id = telescope_id
+                    extra_im.num_trig_pix = event.r0.tel[telescope_id].num_trig_pix
+                    extra_im.trigger_time = event.r0.tel[telescope_id].trigger_time
+                    extra_im.trigger_type = event.r0.tel[telescope_id].trigger_type
+                    extra_im.trig_pix_id = event.r0.tel[telescope_id].trig_pix_id
+
+                    for container in [extra_im, dl1_container, event.r0, tel]:
+                        add_global_metadata(container, metadata)
+
+                    event.r0.prefix = ''
+
+                    writer.write(table_name=f'telescope/image/{tel_name}',
+                                 containers=[event.r0, tel, extra_im])
+                    writer.write(table_name=f'telescope/parameters/{tel_name}',
+                                 containers=[dl1_container, extra_im])
+
+                    # writes mc information per telescope, including photo electron image
+                    if is_simu \
+                            and (event.mc.tel[telescope_id].photo_electron_image > 0).any() \
+                            and config['write_pe_image']:
+                        event.mc.tel[telescope_id].prefix = ''
+                        writer.write(table_name=f'simulation/{tel_name}',
+                                     containers=[event.mc.tel[telescope_id], extra_im]
+                                     )
+
+    if is_simu:
+        ### Reconstruct source position from disp for all events and write the result in the output file
+        for tel_name in ['LST_LSTCam']:
+            focal = OpticsDescription.from_name(tel_name.split('_')[0]).equivalent_focal_length
+            dl1_params_key = f'dl1/event/telescope/parameters/{tel_name}'
+            add_disp_to_parameters_table(output_filename, dl1_params_key, focal)
+
+    # Write energy histogram from simtel file and extra metadata
+    if is_simu:
+        write_simtel_energy_histogram(source, output_filename, obs_id=event.dl0.obs_id, metadata=metadata)
 
 
-    
-def get_events(filename, storedata=False, test=False,
-               concatenate=False, storeimg=False, outdir='./results/'):
+def add_disp_to_parameters_table(dl1_file, table_path, focal):
     """
-    Depreciated, use r0_to_dl1.
+    Reconstruct the disp parameters and source position from a DL1 parameters table and write the result in the file
 
-    Read a Simtelarray file, extract pixels charge, calculate image 
-    parameters and timing parameters and store the result in an hdf5
-    file. 
-    
-    Parameters:
-    -----------
-    filename: str
-    Name of the simtelarray file.
+    Parameters
+    ----------
+    dl1_file: HDF5 DL1 file containing the required field in `table_path`:
+        - mc_alt
+        - mc_az
+        - mc_alt_tel
+        - mc_az_tel
 
-    storedata: boolean
-    True: store extracted data in a hdf5 file
-
-    concatenate: boolean
-    True: store the extracted data at the end of an existing file
-
-    storeimg: boolean
-    True: store also pixel data
-    
-    outdir: srt
-    Output directory
-    
-    Returns:
-    --------
-    pandas DataFrame: output
+    table_path: path to the parameters table in the file
+    focal: focal of the telescope
     """
-    from warnings import warn
-    warn("Deprecated: use r0_to_dl1")
+    df = pd.read_hdf(dl1_file, key=table_path)
+    source_pos_in_camera = sky_to_camera(df.mc_alt.values * u.rad,
+                                         df.mc_az.values * u.rad,
+                                         focal,
+                                         df.mc_alt_tel.values * u.rad,
+                                         df.mc_az_tel.values * u.rad,
+                                         )
+    disp_parameters = disp.disp(df.x.values * u.m,
+                                df.y.values * u.m,
+                                source_pos_in_camera.x,
+                                source_pos_in_camera.y)
 
-    #Particle type:
-    particle_type = utils.guess_type(filename)
-    
-    #Create data frame where DL2 data will be stored:
-
-    features = ['obs_id',
-                'event_id',
-                'mc_energy',
-                'mc_alt',
-                'mc_az',
-                'mc_core_x',
-                'mc_core_y',
-                'mc_h_first_int',
-                'mc_type',
-                'gps_time',
-                'width',
-                'length',
-                'wl',
-                'phi',
-                'psi',
-                'r',
-                'x',
-                'y',
-                'intensity',
-                'skewness',
-                'kurtosis',
-                'mc_alt_tel',
-                'mc_az_tel',
-                'mc_core_distance',
-                'mc_x_max',
-                'time_gradient',
-                'intercept',
-                'src_x',
-                'src_y',
-                'disp',
-                'hadroness',
-                ]
-    
-    output = pd.DataFrame(columns=features)
-
-    #Read LST1 events:
-    source = EventSourceFactory.produce(
-        input_url=filename, 
-        allowed_tels={1}) #Open Simtelarray file
-
-    #Cleaning levels:
-        
-    level1 = {'LSTCam' : 6.}
-    level2 = level1.copy()
-    # We use as second cleaning level just half of the first cleaning level
-    
-    for key in level2:
-        level2[key] *= 0.5
-    
-    
-    log10pixelHGsignal = {}
-    survived = {}
-
-    imagedata = np.array([])
-    
-    for key in level1:
-
-        log10pixelHGsignal[key] = []
-        survived[key] = []
-    i=0
-    for event in source:
-        if i%100==0:
-            print("EVENT_ID: ", event.r0.event_id, "TELS: ",
-                  event.r0.tels_with_data,
-                  "MC Energy:", event.mc.energy )
-
-        i=i+1
-
-        ntels = len(event.r0.tels_with_data)
-
-        
-        if test==True and i > 1000:   # for quick tests
-            break
-        
-        for ii, tel_id in enumerate(event.r0.tels_with_data):
-            
-            geom = event.inst.subarray.tel[tel_id].camera     #Camera geometry
-            tel_coords = event.inst.subarray.tel_coords[
-                event.inst.subarray.tel_indices[tel_id]
-            ]
-            
-            data = event.r0.tel[tel_id].waveform
-            
-            ped = event.mc.tel[tel_id].pedestal    # the pedestal is the 
-            #average (for pedestal events) of the *sum* of all samples,
-            #from sim_telarray
-
-            nsamples = data.shape[2]  # total number of samples
-            
-            # Subtract pedestal baseline. atleast_3d converts 2D to 3D matrix
-            
-            pedcorrectedsamples = data - np.atleast_3d(ped)/nsamples    
-            
-            integrator = LocalPeakIntegrator(None, None)
-            integration, peakpos, window = integrator.extract_charge(
-                pedcorrectedsamples) # these are 2D matrices num_gains * num_pixels
-            
-            chan = 0  # high gain used for now...
-            signals = integration[chan].astype(float)
-
-            dc2pe = event.mc.tel[tel_id].dc_to_pe   # numgains * numpixels
-            signals *= dc2pe[chan]
-
-            # Add all individual pixel signals to the numpy array of the
-            # corresponding camera inside the log10pixelsignal dictionary
-            
-            log10pixelHGsignal[str(geom)].extend(np.log10(signals))  
-            
-            # Apply image cleaning
-        
-            cleanmask = tailcuts_clean(geom, signals, 
-                                       picture_thresh=level1[str(geom)],
-                                       boundary_thresh=level2[str(geom)], 
-                                       keep_isolated_pixels=False, 
-                                       min_number_picture_neighbors=1)
-           
-            survived[str(geom)].extend(cleanmask)  
-           
-            clean = signals.copy()
-            clean[~cleanmask] = 0.0   # set to 0 pixels which did not 
-            # survive cleaning
-            
-            if np.max(clean) < 1.e-6:  # skip images with no pixels
-                continue
-                
-            # Calculate image parameters
-        
-            hillas = hillas_parameters(geom, clean)  
-            foclen = event.inst.subarray.tel[tel_id].optics.equivalent_focal_length
-
-            w = np.rad2deg(np.arctan2(hillas.width, foclen))
-            l = np.rad2deg(np.arctan2(hillas.length, foclen))
-
-            #Calculate Timing parameters
-        
-            peak_time = units.Quantity(peakpos[chan])*units.Unit("ns")
-            timepars = time.timing_parameters(geom,clean,peak_time,hillas)
-            
-            if w >= 0:
-                if storeimg==True:
-                    if imagedata.size == 0:
-                        imagedata = clean
-                    else:
-                        imagedata = np.vstack([imagedata,clean]) #Pixel content
-                
-                #Hillas parameters
-                width = w.value
-                length = l.value
-                phi = hillas.phi.value
-                psi = hillas.psi.value
-                r = hillas.r.value
-                x = hillas.x.value
-                y = hillas.y.value
-                intensity = np.log10(hillas.intensity)
-                skewness = hillas.skewness
-                kurtosis = hillas.kurtosis
-                
-                #MC data:
-                obs_id = event.r0.obs_id
-                event_id = event.r0.event_id
-
-                mc_energy = np.log10(event.mc.energy.value*1e3) #Log10(Energy) in GeV
-                mc_alt = event.mc.alt.value
-                mc_az = event.mc.az.value
-                mc_core_x = event.mc.core_x.value
-                mc_core_y = event.mc.core_y.value
-                mc_h_first_int = event.mc.h_first_int.value
-                mc_type = event.mc.shower_primary_id
-                mc_az_tel = event.mcheader.run_array_direction[0].value
-                mc_alt_tel = event.mcheader.run_array_direction[1].value
-                mc_x_max = event.mc.x_max.value
-                gps_time = event.trig.gps_time.value
-
-                #Calculate mc_core_distance parameters
-
-                mc_core_distance = np.sqrt((
-                    tel_coords.x.value-event.mc.core_x.value)**2
-                    +(tel_coords.y.value-event.mc.core_y.value)**2)
-                
-                #Timing parameters
-
-                time_gradient = timepars['slope'].value
-                intercept = timepars['intercept']
-
-                #Calculate disp_ and Source position in camera coordinates
-                
-                tel = OpticsDescription.from_name('LST') #Telescope description
-                focal_length = tel.equivalent_focal_length.value
-                sourcepos = utils.cal_cam_source_pos(mc_alt,mc_az,
-                                                              mc_alt_tel,mc_az_tel,
-                                                              focal_length) 
-                src_x = sourcepos[0]
-                src_y = sourcepos[1]
-                disp = utils.calc_disp(sourcepos[0],sourcepos[1],
-                                                 x,y)
-                
-                hadroness = 0
-                if particle_type=='proton':
-                    hadroness = 1
-
-                eventdf = pd.DataFrame([[obs_id, event_id, mc_energy, mc_alt, mc_az,
-                                         mc_core_x, mc_core_y, mc_h_first_int, mc_type,
-                                         gps_time, width, length, width / length, phi,
-                                         psi, r, x, y, intensity, skewness, kurtosis,
-                                         mc_alt_tel, mc_az_tel, mc_core_distance, mc_x_max,
-                                         time_gradient, intercept, src_x, src_y,
-                                         disp, hadroness]],
-                                       columns=features)
-                
-                output = output.append(eventdf,
-                                       ignore_index=True)
-
-    outfile = outdir + particle_type + '_events.hdf5'
-    
-    if storedata==True:
-        if (concatenate==False or 
-            (concatenate==True and 
-             np.DataSource().exists(outfile)==False)):
-            output.to_hdf(outfile,
-                          key=particle_type+"_events",mode="w")
-            if storeimg==True:
-                f = h5py.File(outfile,'r+')
-                f.create_dataset('images',data=imagedata)
-                f.close()
-        else:
-            if storeimg==True:
-                f = h5py.File(outfile,'r')
-                images = f['images']
-                del f['images']
-                images = np.vstack([images,imagedata])
-                f.close()
-                saved = pd.read_hdf(outfile,key=particle_type+'_events')
-                output = saved.append(output,ignore_index=True)
-                output.to_hdf(outfile,key=particle_type+"_events",mode="w")
-                f = h5py.File(outfile,'r+')
-                f.create_dataset('images',data=images)
-                f.close()
-            else:
-                saved = pd.read_hdf(outfile,key=particle_type+'_events')
-                output = saved.append(output,ignore_index=True)
-                output.to_hdf(outfile,key=particle_type+"_events",mode="w")
-    del source
-    return output
-
-def get_spectral_w_pars(filename):
-    
-    N = 0 
-    Emin=-1
-    Emax=-1
-    index=0.
-    Omega=0.
-    A=0.
-    Core_max=0.
-
-    particle = utils.guess_type(filename)
-    N = pyhessio.count_mc_generated_events(filename)
-    with pyhessio.open_hessio(filename) as f:
-        f.fill_next_event()
-        Emin = f.get_mc_E_range_Min()
-        Emax = f.get_mc_E_range_Max()
-        index = f.get_spectral_index()
-        Cone = f.get_mc_viewcone_Max()
-        Core_max = f.get_mc_core_range_X()
-        
-    K = N*(1+index)/(Emax**(1+index)-Emin**(1+index))
-    A = np.pi*Core_max**2
-    Omega = 2*np.pi*(1-np.cos(Cone))
-    
-    MeVtoTeV = 1e-6 
-    if particle=="gamma":
-        K_w = 5.7e-16*MeVtoTeV
-        index_w = -2.48
-        E0 = 0.3e6*MeVtoTeV
-
-    if particle=="proton":
-        K_w = 9.6e-2
-        index_w = -2.7
-        E0 = 1
-
-    Simu_E0 = K*E0**index
-    N_ = Simu_E0*(Emax**(index_w+1)-Emin**(index_w+1))/(E0**index_w)/(index_w+1)
-    R = K_w*A*Omega*(Emax**(index_w+1)-Emin**(index_w+1))/(E0**index_w)/(index_w+1)
-
-    
-    w_pars = np.array([E0,index,index_w,R,N_])
-    
-    return w_pars
-    
-def get_spectral_w(w_pars,energy):
-
-    E0 = w_pars[0]
-    index = w_pars[1]
-    index_w = w_pars[2]
-    R = w_pars[3]
-    N_ = w_pars[4]
-
-    w = ((energy/E0)**(index_w-index))*R/N_
-    
-    return w
+    with tables.open_file(dl1_file, mode="a") as file:
+        tab = file.root[table_path]
+        add_column_table(tab, tables.Float32Col, 'disp_dx', disp_parameters[0].value)
+        tab = file.root[table_path]
+        add_column_table(tab, tables.Float32Col, 'disp_dy', disp_parameters[1].value)
+        tab = file.root[table_path]
+        add_column_table(tab, tables.Float32Col, 'disp_norm', disp_parameters[2].value)
+        tab = file.root[table_path]
+        add_column_table(tab, tables.Float32Col, 'disp_angle', disp_parameters[3].value)
+        tab = file.root[table_path]
+        add_column_table(tab, tables.Float32Col, 'disp_sign', disp_parameters[4])
+        tab = file.root[table_path]
+        add_column_table(tab, tables.Float32Col, 'src_x', source_pos_in_camera.x.value)
+        tab = file.root[table_path]
+        add_column_table(tab, tables.Float32Col, 'src_y', source_pos_in_camera.y.value)
