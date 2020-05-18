@@ -13,9 +13,10 @@ test_dir = 'testfiles'
 os.makedirs(test_dir, exist_ok=True)
 
 mc_gamma_testfile = get_dataset_path('gamma_test_large.simtel.gz')
-dl1_file = os.path.join(test_dir, 'dl1_gamma_test_large.simtel.h5')
-dl2_file = os.path.join(test_dir, 'dl2_gamma_test_large.simtel.h5')
+dl1_file = os.path.join(test_dir, 'dl1_gamma_test_large.h5')
+dl2_file = os.path.join(test_dir, 'dl2_gamma_test_large.h5')
 fake_dl2_proton_file = os.path.join(test_dir, 'dl2_fake_proton.simtel.h5')
+fake_dl1_proton_file = os.path.join(test_dir, 'dl1_fake_proton.simtel.h5')
 file_model_energy = os.path.join(test_dir, 'reg_energy.sav')
 file_model_disp = os.path.join(test_dir, 'reg_disp_vector.sav')
 file_model_gh_sep = os.path.join(test_dir, 'cls_gh.sav')
@@ -27,7 +28,7 @@ custom_config = {
         "length": [0, 10],
         "wl": [0, 1],
         "r": [0, 1],
-        "leakage": [0, 1]
+        "leakage2_intensity": [0, 1]
     },
     "tailcut": {
         "picture_thresh":6,
@@ -91,10 +92,16 @@ def test_import_lstio():
     from lstchain import io
 
 @pytest.mark.run(order=1)
-def test_dl0_to_dl1():
-    from lstchain.reco.dl0_to_dl1 import r0_to_dl1
+def test_r0_to_dl1():
+    from lstchain.reco.r0_to_dl1 import r0_to_dl1
     infile = mc_gamma_testfile
     r0_to_dl1(infile, custom_config=custom_config, output_filename=dl1_file)
+
+def test_get_source_dependent_parameters():
+    from lstchain.reco.dl1_to_dl2 import get_source_dependent_parameters
+
+    dl1_params = pd.read_hdf(dl1_file, key=dl1_params_lstcam_key)
+    src_dep_df = get_source_dependent_parameters(dl1_params, custom_config)
 
 @pytest.mark.run(order=2)
 def test_build_models():
@@ -103,7 +110,7 @@ def test_build_models():
 
     reg_energy, reg_disp, cls_gh = build_models(infile, infile, custom_config=custom_config, save_models=False)
 
-    from sklearn.externals import joblib
+    import joblib
     joblib.dump(reg_energy, file_model_energy)
     joblib.dump(reg_disp, file_model_disp)
     joblib.dump(cls_gh, file_model_gh_sep)
@@ -112,7 +119,7 @@ def test_build_models():
 @pytest.mark.run(order=3)
 def test_apply_models():
     from lstchain.reco.dl1_to_dl2 import apply_models
-    from sklearn.externals import joblib
+    import joblib
 
     dl1 = pd.read_hdf(dl1_file, key=dl1_params_lstcam_key)
     dl1 = filter_events(dl1, filters=custom_config["events_filters"])
@@ -121,8 +128,18 @@ def test_apply_models():
     reg_disp = joblib.load(file_model_disp)
     reg_cls_gh = joblib.load(file_model_gh_sep)
 
+
     dl2 = apply_models(dl1, reg_cls_gh, reg_energy, reg_disp, custom_config=custom_config)
     dl2.to_hdf(dl2_file, key=dl2_params_lstcam_key)
+
+def produce_fake_dl1_proton_file():
+    """
+    Produce a fake dl2 proton file by copying the dl2 gamma test file
+    and changing mc_type
+    """
+    events = pd.read_hdf(dl1_file, key=dl1_params_lstcam_key)
+    events.mc_type = 101
+    events.to_hdf(fake_dl1_proton_file, key=dl1_params_lstcam_key)
 
 def produce_fake_dl2_proton_file():
     """
@@ -219,9 +236,10 @@ def test_polar_cartesian():
             p = cartesian_to_polar(x, y)
             np.testing.assert_almost_equal((x, y), polar_to_cartesian(*p))
 
+
 def test_version_not_unkown():
     """
     Test that lstchain.__version__ is not unkown
     """
     import lstchain
-    assert lstchain.__version__ is not 'unknown'
+    assert lstchain.__version__ != 'unknown'
